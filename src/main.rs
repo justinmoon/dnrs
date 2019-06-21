@@ -704,6 +704,28 @@ impl DnsPacket {
     }
 }
 
+fn lookup(qname: &str, qtype: QueryType, server: (&str, u16)) -> Result<DnsPacket, io::Error> {
+    let socket = UdpSocket::bind(("0.0.0.0", 43210))?;
+
+    let mut packet = DnsPacket::new();
+
+    packet.header.id = 6666;
+    packet.header.questions = 1;
+    packet.header.recursion_desired = true;
+    packet
+        .questions
+        .push(DnsQuestion::new(qname.to_string(), qtype));
+
+    let mut req_buffer = BytePacketBuffer::new();
+    packet.write(&mut req_buffer)?;
+    socket.send_to(&req_buffer.buf[0..req_buffer.pos], server)?;
+
+    let mut res_buffer = BytePacketBuffer::new();
+    socket.recv_from(&mut res_buffer.buf)?;
+
+    DnsPacket::from_buffer(&mut res_buffer)
+}
+
 fn parse() {
     let mut f = File::open("response_packet.txt").unwrap();
     let mut buffer = BytePacketBuffer::new();
@@ -785,7 +807,108 @@ fn resolve(url: &str) {
     }
 }
 
+fn serve() {
+    // Forward queries to Google's public DNS
+    let server = ("8.8.8.8", 53);
+
+    // Bind UDP socket on port 2053
+    let socket = UdpSocket::bind(("0.0.0.0", 2053)).unwrap();
+
+    // Handle queries sequentially in a loop
+    loop {
+        let mut req_buffer = BytePacketBuffer::new();
+
+        // Block until we receive a packet, jump to next iteration if read fails
+        // Keep src b/c we'll use it to send our response
+        let (_, src) = match socket.recv_from(&mut req_buffer.buf) {
+            Ok(x) => x,
+            Err(e) => {
+                println!("Failed to read from UDP socket: {:?}", e);
+                continue;
+            }
+        };
+
+        // Convert BytePacketBuffer into DnsPacket, jump to next iteration if it fails
+        let request = match DnsPacket::from_buffer(&mut req_buffer) {
+            Ok(x) => x,
+            Err(e) => {
+                println!("Failed to parse UDP query packet: {:?}", e);
+                continue;
+            }
+        };
+
+        // Create and initialize the response packet
+        let mut packet = DnsPacket::new();
+        packet.header.id = request.header.id;
+        packet.header.recursion_desired = true;
+        packet.header.recursion_available = true;
+        packet.header.response = true;
+
+        // Return `FORMERR` if no questions present
+        if request.questions.is_empty() {
+            packet.header.rescode = ResultCode::FORMERR;
+        }
+        // Otherwise
+        else {
+            let question = &request.questions[0];
+            println!("Received query: {:?}", question);
+
+            // Forward request to Google
+            if let Ok(result) = lookup(&question.name, question.qtype, server) {
+                packet.questions.push(question.clone());
+                packet.header.rescode = result.header.rescode;
+
+                for rec in result.answers {
+                    println!("Answer: {:?}", rec);
+                    packet.answers.push(rec);
+                }
+
+                for rec in result.authorities {
+                    println!("Authority: {:?}", rec);
+                    packet.authorities.push(rec);
+                }
+
+                for rec in result.resources {
+                    println!("Resource: {:?}", rec);
+                    packet.resources.push(rec);
+                }
+            } else {
+                // If lookup failed, set `SERVFAIL` response code
+                packet.header.rescode = ResultCode::SERVFAIL;
+            }
+
+            // Encode and send our response
+            let mut res_buffer = BytePacketBuffer::new();
+            match packet.write(&mut res_buffer) {
+                Ok(_) => {}
+                Err(e) => {
+                    println!("Failed to encode UDP response packet: {:?}", e);
+                    continue;
+                }
+            };
+
+            let len = res_buffer.pos();
+            let data = match res_buffer.get_range(0, len) {
+                Ok(x) => x,
+                Err(e) => {
+                    println!("Failed to retrieve response buffer: {:?}", e);
+                    continue;
+                }
+            };
+
+            match socket.send_to(data, src) {
+                Ok(_) => {}
+                Err(e) => {
+                    println!("Failed to send response buffer: {:?}", e);
+                    continue;
+                }
+            }
+        }
+    }
+}
+
 fn main() {
     //resolve(&"seed.bitcoin.sipa.be");
-    resolve(&"digitalocean.com");
+    //resolve(&"digitalocean.com");
+    serve();
 }
